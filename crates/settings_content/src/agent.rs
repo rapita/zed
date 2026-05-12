@@ -694,6 +694,21 @@ impl std::fmt::Display for ToolPermissionMode {
     }
 }
 
+#[derive(Default, PartialEq, Eq, Deserialize, Serialize, Clone, JsonSchema, MergeFrom, Debug)]
+pub struct CliAgentSettings {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+#[derive(Default, PartialEq, Deserialize, Serialize, Clone, JsonSchema, MergeFrom, Debug)]
+#[serde(transparent)]
+pub struct AllCliAgentsSettings(pub HashMap<String, CliAgentSettings>);
+
 #[cfg(test)]
 mod tests {
     use super::*;

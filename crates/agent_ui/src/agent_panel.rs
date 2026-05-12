@@ -33,7 +33,9 @@ use zed_actions::{
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::cli_conversation_view::{CliConversationView, CliConversationViewEvent};
 use crate::completion_provider::AgentContextSource;
+use crate::thread_entry::ThreadEntry;
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
     AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
@@ -50,7 +52,7 @@ use crate::{
 };
 use agent_settings::AgentSettings;
 use ai_onboarding::AgentPanelOnboarding;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use chrono::{DateTime, Utc};
@@ -126,6 +128,14 @@ pub struct AgentPanelTerminalInfo {
     pub title: SharedString,
     pub created_at: DateTime<Utc>,
     pub has_notification: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentPanelCliInfo {
+    pub thread_id: ThreadId,
+    pub name: SharedString,
+    pub title: SharedString,
+    pub is_alive: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -739,6 +749,10 @@ enum BaseView {
     Terminal {
         terminal_id: TerminalId,
     },
+    CliThread {
+        cli_view: Entity<CliConversationView>,
+        thread_id: ThreadId,
+    },
 }
 
 impl From<AgentThread> for BaseView {
@@ -757,6 +771,7 @@ enum VisibleSurface<'a> {
     Uninitialized,
     AgentThread(&'a Entity<ConversationView>),
     Terminal(&'a Entity<TerminalView>),
+    CliThread(&'a Entity<CliConversationView>),
     Configuration(Option<&'a Entity<AgentConfiguration>>),
 }
 
@@ -769,7 +784,9 @@ impl BaseView {
     pub fn which_font_size_used(&self) -> WhichFontSize {
         match self {
             BaseView::AgentThread { .. } => WhichFontSize::AgentFont,
-            BaseView::Terminal { .. } | BaseView::Uninitialized => WhichFontSize::None,
+            BaseView::Terminal { .. } | BaseView::CliThread { .. } | BaseView::Uninitialized => {
+                WhichFontSize::None
+            }
         }
     }
 }
@@ -801,7 +818,7 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     overlay_view: Option<OverlayView>,
     draft_thread: Option<Entity<ConversationView>>,
-    retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
+    retained_threads: HashMap<ThreadId, ThreadEntry>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1364,7 +1381,8 @@ impl AgentPanel {
                 let draft_id = draft.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(draft_id, draft);
+                self.retained_threads
+                    .insert(draft_id, ThreadEntry::Acp(draft));
             } else if *draft.read(cx).agent_key() != self.selected_agent {
                 let old_draft_id = draft.read(cx).thread_id;
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -1468,6 +1486,127 @@ impl AgentPanel {
     ) {
         self.selected_agent = action.agent.clone().into();
         self.activate_new_thread(true, "agent_panel", window, cx);
+    }
+
+    pub fn start_cli_agent(
+        &mut self,
+        name: SharedString,
+        settings: project::agent_server_store::CliAgentSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let cwd = project.update(cx, |p, cx| {
+                p.visible_worktrees(cx)
+                    .next()
+                    .map(|wt| wt.read(cx).abs_path().to_path_buf())
+            });
+
+            let thread = cx
+                .update(|_, cx| {
+                    agent_cli::CliThread::spawn(
+                        name.clone(),
+                        settings.command.clone(),
+                        settings.args.clone(),
+                        settings.env.clone().into_iter().collect(),
+                        cwd,
+                        project.clone(),
+                        cx,
+                    )
+                })?
+                .await
+                .with_context(|| format!("spawning CLI agent '{}'", name))?;
+
+            this.update_in(cx, |panel, window, cx| {
+                let view = cx.new(|cx| {
+                    CliConversationView::new(
+                        thread.clone(),
+                        workspace.clone(),
+                        project.clone(),
+                        window,
+                        cx,
+                    )
+                });
+
+                cx.subscribe_in(
+                    &view,
+                    window,
+                    |panel, view, event, window, cx| match event {
+                        CliConversationViewEvent::CloseRequested => {
+                            let thread_id = ThreadId::try_parse(
+                                view.read(cx).thread().read(cx).id().0.as_ref(),
+                            )
+                            .expect("CliThreadId is always a valid UUID");
+                            panel.close_cli_thread_by_id(thread_id, window, cx);
+                        }
+                        CliConversationViewEvent::RestartRequested => {
+                            panel.restart_cli_thread(view.clone(), window, cx);
+                        }
+                        CliConversationViewEvent::TitleChanged => {
+                            cx.emit(AgentPanelEvent::EntryChanged);
+                            cx.notify();
+                        }
+                    },
+                )
+                .detach();
+
+                cx.subscribe(&thread, |_panel, _t, _event, cx| {
+                    cx.emit(AgentPanelEvent::EntryChanged);
+                    cx.notify();
+                })
+                .detach();
+
+                let thread_id = ThreadId::try_parse(thread.read(cx).id().0.as_ref())
+                    .expect("CliThreadId is always a valid UUID");
+                panel
+                    .retained_threads
+                    .insert(thread_id, crate::thread_entry::ThreadEntry::Cli(view));
+                panel.activate_retained_thread(thread_id, true, window, cx);
+                cx.emit(AgentPanelEvent::EntryChanged);
+                cx.notify();
+            })?;
+
+            anyhow::Ok(())
+        })
+    }
+
+    fn close_cli_thread(
+        &mut self,
+        view: gpui::Entity<CliConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = view.read(cx).thread().clone();
+        let thread_id = ThreadId::try_parse(thread.read(cx).id().0.as_ref())
+            .expect("CliThreadId is always a valid UUID");
+        thread.update(cx, |t, cx| t.shutdown(cx)).detach();
+        self.retained_threads.remove(&thread_id);
+        cx.notify();
+    }
+
+    fn restart_cli_thread(
+        &mut self,
+        view: gpui::Entity<CliConversationView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = view.read(cx).thread().read(cx).name();
+        let settings = project::agent_server_store::AllCliAgentsSettings::get_global(cx)
+            .get(name.as_ref())
+            .cloned();
+        let Some(settings) = settings else {
+            log::error!("CLI agent '{name}' no longer in settings; cannot restart");
+            return;
+        };
+        let thread = view.read(cx).thread().clone();
+        let thread_id = ThreadId::try_parse(thread.read(cx).id().0.as_ref())
+            .expect("CliThreadId is always a valid UUID");
+        thread.update(cx, |t, cx| t.shutdown(cx)).detach();
+        self.retained_threads.remove(&thread_id);
+        self.start_cli_agent(name, settings, window, cx)
+            .detach_and_log_err(cx);
+        cx.notify();
     }
 
     pub fn new_terminal(
@@ -2262,9 +2401,25 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let conversation_view = if let Some(view) = self.retained_threads.remove(&id) {
-            self.try_make_empty_draft_ephemeral(view.clone(), cx);
-            view
+        let conversation_view = if let Some(entry) = self.retained_threads.remove(&id) {
+            match entry {
+                ThreadEntry::Cli(cli_view) => {
+                    self.set_base_view(
+                        BaseView::CliThread {
+                            cli_view,
+                            thread_id: id,
+                        },
+                        focus,
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                ThreadEntry::Acp(cv) => {
+                    self.try_make_empty_draft_ephemeral(cv.clone(), cx);
+                    cv
+                }
+            }
         } else if let Some(draft) = &self.draft_thread {
             if draft.read(cx).thread_id == id {
                 draft.clone()
@@ -2334,6 +2489,13 @@ impl AgentPanel {
         }
     }
 
+    pub fn active_cli_thread_id(&self) -> Option<ThreadId> {
+        match &self.base_view {
+            BaseView::CliThread { thread_id, .. } => Some(*thread_id),
+            _ => None,
+        }
+    }
+
     pub fn has_terminal(&self, terminal_id: TerminalId) -> bool {
         self.terminals.contains_key(&terminal_id)
     }
@@ -2354,6 +2516,79 @@ impl AgentPanel {
             .collect()
     }
 
+    pub fn cli_threads(&self, cx: &App) -> Vec<AgentPanelCliInfo> {
+        let build_info =
+            |thread_id: ThreadId, cli_view: &Entity<CliConversationView>| -> AgentPanelCliInfo {
+                let cli_view_ref = cli_view.read(cx);
+                let thread = cli_view_ref.thread().read(cx);
+                AgentPanelCliInfo {
+                    thread_id,
+                    name: thread.name(),
+                    title: cli_view_ref.title(cx),
+                    is_alive: thread.is_alive(cx),
+                }
+            };
+
+        let mut result: Vec<AgentPanelCliInfo> = self
+            .retained_threads
+            .iter()
+            .filter_map(|(thread_id, entry)| {
+                entry
+                    .as_cli()
+                    .map(|cli_view| build_info(*thread_id, cli_view))
+            })
+            .collect();
+
+        if let BaseView::CliThread {
+            cli_view,
+            thread_id,
+        } = &self.base_view
+        {
+            result.push(build_info(*thread_id, cli_view));
+        }
+
+        result
+    }
+
+    pub fn activate_cli_thread(
+        &mut self,
+        thread_id: ThreadId,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_retained_thread(thread_id, focus, window, cx);
+    }
+
+    pub fn close_cli_thread_by_id(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self
+            .retained_threads
+            .get(&thread_id)
+            .and_then(|entry| entry.as_cli())
+            .cloned();
+        if let Some(view) = view {
+            self.close_cli_thread(view, cx);
+        } else if let BaseView::CliThread {
+            cli_view,
+            thread_id: active_id,
+        } = &self.base_view
+        {
+            if *active_id == thread_id {
+                let cli_view = cli_view.clone();
+                self.close_cli_thread(cli_view, cx);
+                self.base_view = BaseView::Uninitialized;
+                self.refresh_base_view_subscriptions(window, cx);
+                self.activate_draft(false, "agent_panel", window, cx);
+            }
+        }
+        cx.emit(AgentPanelEvent::EntryChanged);
+    }
+
     pub fn editor_text(&self, id: ThreadId, cx: &App) -> Option<String> {
         self.editor_text_if_in_memory(id, cx).flatten()
     }
@@ -2362,6 +2597,7 @@ impl AgentPanel {
         let cv = self
             .retained_threads
             .get(&id)
+            .and_then(|entry| entry.as_acp())
             .or_else(|| {
                 self.draft_thread
                     .as_ref()
@@ -2953,7 +3189,7 @@ impl AgentPanel {
         self.workspace_id
     }
 
-    pub fn retained_threads(&self) -> &HashMap<ThreadId, Entity<ConversationView>> {
+    pub fn retained_threads(&self) -> &HashMap<ThreadId, ThreadEntry> {
         &self.retained_threads
     }
 
@@ -2968,7 +3204,11 @@ impl AgentPanel {
         self.active_conversation_view()
             .into_iter()
             .cloned()
-            .chain(self.retained_threads.values().cloned())
+            .chain(
+                self.retained_threads
+                    .values()
+                    .filter_map(|entry| entry.as_acp().cloned()),
+            )
             .collect()
     }
 
@@ -2991,10 +3231,11 @@ impl AgentPanel {
     }
 
     pub fn cancel_thread(&self, thread_id: &ThreadId, cx: &mut Context<Self>) -> bool {
-        let conversation_views = self
-            .active_conversation_view()
-            .into_iter()
-            .chain(self.retained_threads.values());
+        let conversation_views = self.active_conversation_view().into_iter().chain(
+            self.retained_threads
+                .values()
+                .filter_map(|entry| entry.as_acp()),
+        );
 
         for conversation_view in conversation_views {
             if *thread_id == conversation_view.read(cx).thread_id {
@@ -3017,7 +3258,7 @@ impl AgentPanel {
             });
         }
 
-        for conversation_view in self.retained_threads.values() {
+        for conversation_view in self.retained_threads.values().filter_map(|e| e.as_acp()) {
             conversation_view.update(cx, |conversation_view, cx| {
                 conversation_view.set_work_dirs(new_work_dirs.clone(), cx);
             });
@@ -3043,6 +3284,15 @@ impl AgentPanel {
     }
 
     fn retain_running_thread(&mut self, old_view: BaseView, cx: &mut Context<Self>) {
+        if let BaseView::CliThread {
+            cli_view,
+            thread_id,
+        } = old_view
+        {
+            self.retained_threads
+                .insert(thread_id, crate::thread_entry::ThreadEntry::Cli(cli_view));
+            return;
+        }
         let BaseView::AgentThread { conversation_view } = old_view else {
             return;
         };
@@ -3056,7 +3306,8 @@ impl AgentPanel {
                 let thread_id = conversation_view.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(thread_id, conversation_view);
+                self.retained_threads
+                    .insert(thread_id, ThreadEntry::Acp(conversation_view));
                 self.cleanup_retained_threads(cx);
             }
             return;
@@ -3068,7 +3319,8 @@ impl AgentPanel {
             return;
         }
 
-        self.retained_threads.insert(thread_id, conversation_view);
+        self.retained_threads
+            .insert(thread_id, ThreadEntry::Acp(conversation_view));
         self.cleanup_retained_threads(cx);
     }
 
@@ -3076,7 +3328,10 @@ impl AgentPanel {
         let mut potential_removals = self
             .retained_threads
             .iter()
-            .filter(|(_id, view)| {
+            .filter(|(_id, entry)| {
+                let Some(view) = entry.as_acp() else {
+                    return false;
+                };
                 let Some(thread_view) = view.read(cx).root_thread_view() else {
                     return true;
                 };
@@ -3087,7 +3342,12 @@ impl AgentPanel {
 
         let max_idle = MaxIdleRetainedThreads::global(cx);
 
-        potential_removals.sort_unstable_by_key(|(_, view)| view.read(cx).updated_at(cx));
+        potential_removals.sort_unstable_by_key(|(_, entry)| {
+            entry
+                .as_acp()
+                .map(|view| view.read(cx).updated_at(cx))
+                .unwrap_or_default()
+        });
         let n = potential_removals.len().saturating_sub(max_idle);
         let to_remove = potential_removals
             .into_iter()
@@ -3208,6 +3468,16 @@ impl AgentPanel {
                 }
                 None
             }
+            BaseView::CliThread { cli_view, .. } => {
+                self._thread_view_subscription = None;
+                let focus_handle = cli_view.focus_handle(cx);
+                self._active_thread_focus_subscription =
+                    Some(cx.on_focus_in(&focus_handle, window, |_this, _window, cx| {
+                        cx.emit(AgentPanelEvent::ActiveViewFocused);
+                        cx.notify();
+                    }));
+                None
+            }
             BaseView::Uninitialized => {
                 self._thread_view_subscription = None;
                 self._active_thread_focus_subscription = None;
@@ -3236,6 +3506,7 @@ impl AgentPanel {
                 .get(terminal_id)
                 .map(|terminal| VisibleSurface::Terminal(&terminal.view))
                 .unwrap_or(VisibleSurface::Uninitialized),
+            BaseView::CliThread { cli_view, .. } => VisibleSurface::CliThread(cli_view),
         }
     }
 
@@ -3370,14 +3641,21 @@ impl AgentPanel {
             );
             return;
         }
-        if let Some(conversation_view) = self.retained_threads.remove(&thread_id) {
-            self.try_make_empty_draft_ephemeral(conversation_view.clone(), cx);
-            self.set_base_view(
-                BaseView::AgentThread { conversation_view },
-                focus,
-                window,
-                cx,
-            );
+        if let Some(entry) = self.retained_threads.remove(&thread_id) {
+            match entry {
+                ThreadEntry::Acp(conversation_view) => {
+                    self.try_make_empty_draft_ephemeral(conversation_view.clone(), cx);
+                    self.set_base_view(
+                        BaseView::AgentThread { conversation_view },
+                        focus,
+                        window,
+                        cx,
+                    );
+                }
+                cli @ ThreadEntry::Cli(_) => {
+                    self.retained_threads.insert(thread_id, cli);
+                }
+            }
             return;
         }
 
@@ -3580,6 +3858,7 @@ impl Focusable for AgentPanel {
             VisibleSurface::Uninitialized => self.focus_handle.clone(),
             VisibleSurface::AgentThread(conversation_view) => conversation_view.focus_handle(cx),
             VisibleSurface::Terminal(terminal_view) => terminal_view.focus_handle(cx),
+            VisibleSurface::CliThread(cli_view) => cli_view.focus_handle(cx),
             VisibleSurface::Configuration(configuration) => {
                 if let Some(configuration) = configuration {
                     configuration.focus_handle(cx)
@@ -3736,7 +4015,7 @@ impl AgentPanel {
 
         match &self.base_view {
             BaseView::Uninitialized => false,
-            BaseView::Terminal { .. } => true,
+            BaseView::Terminal { .. } | BaseView::CliThread { .. } => true,
             BaseView::AgentThread { conversation_view } => {
                 let has_entries = conversation_view
                     .read(cx)
@@ -3977,6 +4256,32 @@ impl AgentPanel {
                     Label::new("Terminal").into_any_element()
                 }
             }
+            VisibleSurface::CliThread(cli_view) => {
+                let title = cli_view.read(cx).title(cx);
+                let cli_view_for_click = cli_view.clone();
+                if let Some(title_editor) = cli_view.read(cx).title_editor().cloned() {
+                    h_flex()
+                        .id("cli-thread-title")
+                        .flex_1()
+                        .cursor_text()
+                        .overflow_x_scroll()
+                        .child(title_editor)
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("cli-thread-title")
+                        .flex_1()
+                        .cursor_text()
+                        .overflow_x_scroll()
+                        .child(Label::new(title).color(Color::Muted).single_line())
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            cli_view_for_click.update(cx, |view, cx| {
+                                view.begin_editing_title(window, cx);
+                            });
+                        }))
+                        .into_any_element()
+                }
+            }
             VisibleSurface::Configuration(_) => {
                 Label::new("Settings").truncate().into_any_element()
             }
@@ -4035,7 +4340,10 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
-        let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
+        let showing_terminal = matches!(
+            self.visible_surface(),
+            VisibleSurface::Terminal(_) | VisibleSurface::CliThread(_)
+        );
 
         let conversation_view = match &self.base_view {
             BaseView::AgentThread { conversation_view } => Some(conversation_view.clone()),
@@ -4152,9 +4460,16 @@ impl AgentPanel {
 
         let supports_terminal = self.supports_terminal(cx);
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
-
+        let showing_cli = matches!(self.visible_surface(), VisibleSurface::CliThread(_));
         let (selected_agent_custom_icon, selected_agent_label) = if showing_terminal {
             (None, SharedString::from("Terminal"))
+        } else if showing_cli {
+            let cli_view = match self.visible_surface() {
+                VisibleSurface::CliThread(v) => v,
+                _ => unreachable!(),
+            };
+            let name = cli_view.read(cx).thread().read(cx).name();
+            (None, name)
         } else if let Agent::Custom { id, .. } = &self.selected_agent {
             let store = agent_server_store.read(cx);
             let icon = store.agent_icon(&id);
@@ -4171,7 +4486,9 @@ impl AgentPanel {
             BaseView::AgentThread { conversation_view } => {
                 conversation_view.read(cx).as_native_thread(cx)
             }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => None,
+            BaseView::Terminal { .. } | BaseView::CliThread { .. } | BaseView::Uninitialized => {
+                None
+            }
         };
 
         let new_thread_menu_builder: Rc<
@@ -4364,6 +4681,52 @@ impl AgentPanel {
 
                             menu
                         })
+                        .map(|mut menu| {
+                            let cli_agents =
+                                project::agent_server_store::AllCliAgentsSettings::get_global(cx)
+                                    .clone();
+                            if !cli_agents.is_empty() {
+                                menu = menu.separator().header("CLI Agents");
+                                let mut cli_agent_items = cli_agents
+                                    .iter()
+                                    .map(|(name, settings)| (name.clone(), settings.clone()))
+                                    .collect::<Vec<_>>();
+                                cli_agent_items.sort_unstable_by_key(|a| a.0.to_lowercase());
+                                for (name, settings) in cli_agent_items {
+                                    let name_shared: SharedString = name.into();
+                                    menu = menu.item(
+                                        ContextMenuEntry::new(name_shared.clone())
+                                            .icon(IconName::Terminal)
+                                            .icon_color(Color::Muted)
+                                            .handler({
+                                                let workspace = workspace.clone();
+                                                let name_shared = name_shared.clone();
+                                                move |window, cx| {
+                                                    if let Some(workspace) = workspace.upgrade() {
+                                                        workspace.update(cx, |workspace, cx| {
+                                                            if let Some(panel) =
+                                                                workspace.panel::<AgentPanel>(cx)
+                                                            {
+                                                                panel.update(cx, |panel, cx| {
+                                                                    panel
+                                                                        .start_cli_agent(
+                                                                            name_shared.clone(),
+                                                                            settings.clone(),
+                                                                            window,
+                                                                            cx,
+                                                                        )
+                                                                        .detach_and_log_err(cx);
+                                                                });
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                            }),
+                                    );
+                                }
+                            }
+                            menu
+                        })
                         .separator()
                         .item(
                             ContextMenuEntry::new("Add More Agents")
@@ -4387,7 +4750,7 @@ impl AgentPanel {
 
         let has_custom_icon = selected_agent_custom_icon.is_some();
         let selected_agent_custom_icon_for_button = selected_agent_custom_icon.clone();
-        let selected_agent_builtin_icon = if showing_terminal {
+        let selected_agent_builtin_icon = if showing_terminal || showing_cli {
             Some(IconName::Terminal)
         } else {
             self.selected_agent.icon()
@@ -4441,7 +4804,10 @@ impl AgentPanel {
 
         let mode = if self.is_overlay_open() {
             ToolbarMode::Overlay
-        } else if matches!(self.base_view, BaseView::Terminal { .. }) {
+        } else if matches!(
+            self.base_view,
+            BaseView::Terminal { .. } | BaseView::CliThread { .. }
+        ) {
             ToolbarMode::Terminal
         } else if self.active_thread_has_messages(cx) {
             ToolbarMode::ActiveThread
@@ -4627,7 +4993,7 @@ impl AgentPanel {
                     return false;
                 }
             }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => {
+            BaseView::Terminal { .. } | BaseView::CliThread { .. } | BaseView::Uninitialized => {
                 return false;
             }
         }
@@ -4679,7 +5045,9 @@ impl AgentPanel {
             });
 
         match &self.base_view {
-            BaseView::Uninitialized | BaseView::Terminal { .. } => false,
+            BaseView::Uninitialized | BaseView::Terminal { .. } | BaseView::CliThread { .. } => {
+                false
+            }
             BaseView::AgentThread { conversation_view } => {
                 if conversation_view.read(cx).as_native_thread(cx).is_some() {
                     let history_is_empty = ThreadStore::global(cx).read(cx).is_empty();
@@ -4808,7 +5176,7 @@ impl AgentPanel {
                     conversation_view.insert_dragged_files(paths, added_worktrees, window, cx);
                 });
             }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => {}
+            BaseView::Terminal { .. } | BaseView::CliThread { .. } | BaseView::Uninitialized => {}
         }
     }
 
@@ -4864,6 +5232,7 @@ impl Render for AgentPanel {
                     .child(conversation_view.clone())
                     .child(self.render_drag_target(cx)),
                 VisibleSurface::Terminal(terminal_view) => parent.child(terminal_view.clone()),
+                VisibleSurface::CliThread(cli_view) => parent.child(cli_view.clone()),
                 VisibleSurface::Configuration(configuration) => {
                     parent.children(configuration.cloned())
                 }
@@ -7012,6 +7381,8 @@ mod tests {
                     .retained_threads
                     .get(thread_id)
                     .expect("retained thread should exist")
+                    .as_acp()
+                    .expect("retained thread should be an ACP thread")
                     .clone();
                 conversation_view.update(cx, |view, cx| {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
@@ -7087,6 +7458,8 @@ mod tests {
                     .retained_threads
                     .get(thread_id)
                     .expect("retained thread should exist")
+                    .as_acp()
+                    .expect("retained thread should be an ACP thread")
                     .clone();
                 conversation_view.update(cx, |view, cx| {
                     view.set_updated_at(base_time + Duration::from_secs(index as u64), cx);
@@ -7287,7 +7660,12 @@ mod tests {
 
         // Verify thread A's (background) work_dirs are also updated.
         let updated_a_paths = panel.read_with(&cx, |panel, cx| {
-            let bg_view = panel.retained_threads.get(&thread_id_a).unwrap();
+            let bg_view = panel
+                .retained_threads
+                .get(&thread_id_a)
+                .unwrap()
+                .as_acp()
+                .unwrap();
             let root_thread = bg_view.read(cx).root_thread_view().unwrap();
             root_thread
                 .read(cx)
@@ -7307,7 +7685,12 @@ mod tests {
 
         // Verify thread idle C was also updated.
         let updated_c_paths = panel.read_with(&cx, |panel, cx| {
-            let bg_view = panel.retained_threads.get(&thread_id_c).unwrap();
+            let bg_view = panel
+                .retained_threads
+                .get(&thread_id_c)
+                .unwrap()
+                .as_acp()
+                .unwrap();
             let root_thread = bg_view.read(cx).root_thread_view().unwrap();
             root_thread
                 .read(cx)
@@ -7361,7 +7744,12 @@ mod tests {
         );
 
         let after_remove_a = panel.read_with(&cx, |panel, cx| {
-            let bg_view = panel.retained_threads.get(&thread_id_a).unwrap();
+            let bg_view = panel
+                .retained_threads
+                .get(&thread_id_a)
+                .unwrap()
+                .as_acp()
+                .unwrap();
             let root_thread = bg_view.read(cx).root_thread_view().unwrap();
             root_thread
                 .read(cx)
@@ -8902,6 +9290,8 @@ mod tests {
                 .retained_threads
                 .get(&_thread_id_a)
                 .expect("thread A should be retained")
+                .as_acp()
+                .expect("thread A should be an ACP thread")
                 .clone()
         });
         retained_conversation_a.update(&mut cx, |conversation, cx| {

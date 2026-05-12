@@ -145,6 +145,7 @@ pub struct SettingsContent {
 
     pub agent: Option<AgentSettingsContent>,
     pub agent_servers: Option<AllAgentServersSettings>,
+    pub cli_agents: Option<AllCliAgentsSettings>,
 
     /// Configuration of audio in Zed.
     pub audio: Option<AudioSettingsContent>,
