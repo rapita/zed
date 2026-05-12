@@ -157,6 +157,12 @@ fn assert_remote_project_integration_sidebar_state(
                     terminal.title
                 );
             }
+            ListEntry::CliThread(cli_thread) => {
+                panic!(
+                    "unexpected CLI thread while simulating remote project integration flicker: title=`{}`",
+                    cli_thread.title
+                );
+            }
         }
     }
 
@@ -543,6 +549,9 @@ fn visible_entries_as_strings(
                         let title = &terminal.title;
                         let worktree = format_linked_worktree_chips(&terminal.worktrees);
                         format!("  {title}{worktree}{selected}")
+                    }
+                    ListEntry::CliThread(cli_thread) => {
+                        format!("  cli:{}{selected}", cli_thread.title)
                     }
                 }
             })
@@ -4764,6 +4773,12 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                     panic!(
                         "unexpected sidebar terminal while opening linked worktree thread: title=`{}`",
                         terminal.title
+                    );
+                }
+                ListEntry::CliThread(cli_thread) => {
+                    panic!(
+                        "unexpected CLI thread while opening linked worktree thread: title=`{}`",
+                        cli_thread.title
                     );
                 }
             }

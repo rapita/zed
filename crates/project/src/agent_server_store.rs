@@ -20,6 +20,7 @@ use rpc::{
 use schemars::JsonSchema;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+pub use settings::CliAgentSettings;
 use settings::{RegisterSetting, SettingsStore};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -1936,6 +1937,29 @@ impl settings::Settings for AllAgentServersSettings {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, JsonSchema, RegisterSetting)]
+pub struct AllCliAgentsSettings(pub HashMap<String, CliAgentSettings>);
+
+impl AllCliAgentsSettings {
+    pub fn get(&self, name: &str) -> Option<&CliAgentSettings> {
+        self.0.get(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &CliAgentSettings)> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl settings::Settings for AllCliAgentsSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self(content.cli_agents.clone().unwrap_or_default().0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2289,5 +2313,31 @@ mod tests {
                 "agent-b tx should have been transferred"
             );
         });
+    }
+
+    #[test]
+    fn cli_agent_settings_deserializes() {
+        let raw = r#"{
+            "claude": {
+                "command": "claude",
+                "args": [],
+                "env": {},
+                "icon": "terminal"
+            },
+            "aider": {
+                "command": "aider",
+                "args": ["--no-stream"]
+            }
+        }"#;
+        let content: settings::settings_content::AllCliAgentsSettings =
+            serde_json::from_str(raw).expect("valid JSON");
+        let settings = AllCliAgentsSettings(content.0);
+        assert_eq!(settings.0.len(), 2);
+        let claude = settings.get("claude").expect("claude entry");
+        assert_eq!(claude.command, "claude");
+        assert_eq!(claude.icon.as_deref(), Some("terminal"));
+        let aider = settings.get("aider").expect("aider entry");
+        assert_eq!(aider.args, vec!["--no-stream".to_string()]);
+        assert_eq!(aider.icon, None);
     }
 }

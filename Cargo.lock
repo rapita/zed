@@ -271,6 +271,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "futures 0.3.32",
+ "gpui",
+ "project",
+ "serde",
+ "settings",
+ "task",
+ "terminal",
+ "ui",
+ "util",
+ "uuid",
+]
+
+[[package]]
 name = "agent_servers"
 version = "0.1.0"
 dependencies = [
@@ -345,6 +363,7 @@ dependencies = [
  "action_log",
  "agent",
  "agent-client-protocol",
+ "agent_cli",
  "agent_servers",
  "agent_settings",
  "ai_onboarding",

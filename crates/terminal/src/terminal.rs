@@ -2234,6 +2234,10 @@ impl Terminal {
         }
     }
 
+    pub fn child_exit_status(&self) -> Option<ExitStatus> {
+        self.child_exited
+    }
+
     pub fn task(&self) -> Option<&TaskState> {
         self.task.as_ref()
     }
